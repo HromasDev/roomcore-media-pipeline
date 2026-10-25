@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: media
+      POSTGRES_PASSWORD: media
+      POSTGRES_DB: media
+    ports:
+      - "127.0.0.1:55434:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U media"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # MinIO: локальное S3-совместимое хранилище. Бакеты uploads (приватный) и previews
+  # (публичное чтение) создаёт само приложение при старте (см. ensureBuckets)
+  minio:
+    image: bitnamilegacy/minio:2025.7.23
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Kafka-совместимый брокер (Kafka API), без ZooKeeper и JVM
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build: .
+    command: ["bun", "run", "src/api.ts"]
+    environment: &app-env
+      DATABASE_URL: postgres://media:media@postgres:5432/media
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_URL: http://minio:9000/previews
+      KAFKA_BROKERS: redpanda:29092
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+
+  # Воркер можно масштабировать: docker compose up -d --scale worker=3
+  worker:
+    build: .
+    command: ["bun", "run", "src/worker.ts"]
+    environment: *app-env
+    depends_on:
+      - api
+
+volumes:
+  pg-data:
+  minio-data:
+  redpanda-data:
